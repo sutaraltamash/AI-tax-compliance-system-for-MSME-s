@@ -3,7 +3,7 @@
 
 set(TEST_SOURCES
   statematrix_test.cpp
-  # ruleengine_test.cpp      (Step D)
+  ruleengine_test.cpp
   # gstrgenerator_test.cpp   (Step E)
 )
 

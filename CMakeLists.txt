@@ -27,6 +27,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(tax_core STATIC
   backend/src/StateMatrix.cpp
+  backend/src/RuleEngine.cpp
 )
 
 # crow.h/crow/*.h resolve via -I backend/include ("crow/..." style includes);

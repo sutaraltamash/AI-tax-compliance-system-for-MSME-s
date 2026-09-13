@@ -6,9 +6,13 @@
     "checks": [
       {
         "field": "dot.path.into.extracted.document OR state matrix field (e.g. invoice.place_of_supply)",
-        "op": "eq|neq|gt|gte|lt|lte|present|absent|eq_true|eq_false|length_in|ne_cross",
+        "op": "eq|neq|gt|gte|lt|lte|present|absent|eq_true|eq_false|token_length_out|ne_cross",
         "value": "literal expected value (omitted for present/absent/eq_true/eq_false)",
+        "values": "allowed-token-lengths list, used by op=token_length_out (a violation fires when the string token's length is OUTSIDE the set)",
         "value_from": "cross-field reference: compare 'field' against another path instead of a literal (used by op=ne_cross)"
+      },
+      {
+        "groups": "A check may instead be a nested composite {operator:'AND'|'OR', checks:[...]} with no 'field'; it is evaluated recursively and counts as one check. Used to express grouped conditions, e.g. R-CLASS-007 flags a missing buyer GSTIN only when the classification is not B2C."
       }
     ],
     "rule_level": {
@@ -111,14 +115,14 @@
       "category": "hsn",
       "severity": "warning",
       "status_field": "hsn_digits_valid",
-      "summary": "Every HSN code on the invoice must be 4 or 6 digits.",
+      "summary": "Every HSN code on the invoice must be 4, 6 or 8 digits.",
       "condition": {
         "operator": "AND",
         "checks": [
-          { "field": "invoice.hsn_string", "op": "token_length_in", "values": [4, 6], "source": "thresholds.hsn_min_digits / hsn_max_digits" }
+          { "field": "invoice.hsn_string", "op": "token_length_out", "values": [4, 6, 8], "source": "thresholds.hsn_min_digits / hsn_max_digits; 8-digit export codes also valid" }
         ]
       },
-      "message_template": "Line item {line_index} reports HSN '{hsn}'. Under CGST Notification 01/2026, HSN must be 4 or 6 digits (8 digits if annual turnover exceeds INR 5 Crore). Please provide the correct HSN code.",
+      "message_template": "Line item {line_index} reports HSN '{hsn}'. Under CGST Notification 01/2026, HSN must be 4, 6 or 8 digits (8-digit codes cover exports and high-turnover filers). Please provide the correct HSN code.",
       "resolve_gap_by": "correct_hsn",
       "action_required": "INPUT_TEXT"
     },
@@ -148,15 +152,21 @@
       "category": "classification",
       "severity": "info",
       "status_field": "b2b_b2c_determined",
-      "summary": "Every invoice must be classified B2B or B2C; an undetermined status is a gap requiring user input.",
+      "summary": "Every invoice must be classified B2B or B2C; an undetermined status -- or a B2B/unknown supply that lacks a buyer GSTIN -- is a gap requiring user input. Legitimate B2C sales (no buyer GSTIN) are never flagged.",
       "condition": {
         "operator": "OR",
         "checks": [
           { "field": "invoice.classification", "op": "eq", "value": "UNDETERMINED" },
-          { "field": "buyer.gstin", "op": "absent" }
+          {
+            "operator": "AND",
+            "checks": [
+              { "field": "invoice.classification", "op": "neq", "value": "B2C" },
+              { "field": "buyer.gstin", "op": "absent" }
+            ]
+          }
         ]
       },
-      "message_template": "This transaction could not be classified as B2B or B2C. Is the buyer registered under GST? Provide the buyer GSTIN (B2B) or confirm unregistered buyer (B2C).",
+      "message_template": "This transaction needs classification input: it is undetermined, or a B2B/unknown supply lacks the buyer's GSTIN. Is the buyer registered under GST? Provide the buyer GSTIN (B2B) or confirm the supply classification.",
       "resolve_gap_by": "buyer_registration",
       "action_required": "INPUT_TEXT"
     }
