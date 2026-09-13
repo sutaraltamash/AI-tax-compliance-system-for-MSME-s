@@ -4,7 +4,7 @@
 set(TEST_SOURCES
   statematrix_test.cpp
   ruleengine_test.cpp
-  # gstrgenerator_test.cpp   (Step E)
+  gstrgenerator_test.cpp
 )
 
 foreach(test_src ${TEST_SOURCES})
