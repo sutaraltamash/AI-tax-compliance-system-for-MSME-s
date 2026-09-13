@@ -5,25 +5,31 @@
 //
 //   * /ws negotiates a session (SESSION_INIT with a fresh session id) and then
 //     dispatches the architecture.md §10 message contract onto tax::Pipeline:
-//       UPLOAD_INVOICE -> MockExtractor (IExtractor seam) -> StateMatrix ->
-//                        RuleEngine -> SQLite persistence -> CHAT_MESSAGE gaps
+//       UPLOAD_INVOICE -> IExtractor (mock or live Gemini per AI_MODE) ->
+//                        StateMatrix -> RuleEngine -> SQLite persistence ->
+//                        CHAT_MESSAGE gaps
 //       USER_REPLY     -> archived to the transcript
 //       REQUEST_FILING -> GSTRGenerator CSVs -> FILING_READY
 //   * /   serves index.html, /assets/<path> serves the frontend bundle.
 //
-// The extraction seam is swapped for the live GeminiClient by replacing the
-// MockExtractor in the Pipeline constructor call below (Step G).
+// The extraction seam selection lives in makeExtractor() below: AI_MODE=live
+// builds a GeminiClient (reading GEMINI_API_KEY / GEMINI_MODEL from the
+// environment), anything else falls back to the offline MockExtractor.
 // ============================================================================
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <sstream>
 
 #include "crow/crow.h"
 #include "crow/json.h"
 #include "crow/middlewares/cors.h"
 
+#include "GeminiClient.hpp"
+#include "HttpClient.hpp"
 #include "IExtractor.hpp"
 #include "MockExtractor.hpp"
 #include "Pipeline.hpp"
@@ -49,6 +55,69 @@ namespace
             return std::atoi(v);
         }
         return fallback;
+    }
+
+    std::string readFileText(const std::string& path)
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f)
+        {
+            throw std::runtime_error("cannot open file: " + path);
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+
+    // ------------------------------------------------------------------
+    // Extractor selection (Phase 1 = mock, Phase 2 = live Gemini)
+    //
+    // When AI_MODE=live the server MUST have GEMINI_API_KEY set; at startup
+    // this is checked before any WebSocket client can hit /ws, so a missing
+    // key is caught instantly with a clear message instead of failing deep
+    // inside a handler. If the key is present but matches the default
+    // placeholder, we warn loudly (stderr) and still refuse to start live,
+    // because a placeholder in production is a configuration error.
+    // ------------------------------------------------------------------
+    std::unique_ptr<tax::IExtractor> makeExtractor()
+    {
+        const std::string mode = getEnv("AI_MODE", "mock");
+        const std::string schemaPath =
+            getEnv("GEMINI_SCHEMA_PATH", "./config/gemini_schema.json");
+        const std::string schemaJson = readFileText(schemaPath);
+
+        if (mode == "live")
+        {
+            const std::string key = getEnv("GEMINI_API_KEY", "");
+            if (key.empty())
+            {
+                throw std::runtime_error(
+                    "AI_MODE=live requires GEMINI_API_KEY; "
+                    "set it in the environment or .env");
+            }
+            const std::string model =
+                getEnv("GEMINI_MODEL", "gemini-2.5-pro");
+
+            // Fail-fast notice for a common misconfiguration.
+            const std::string placeholder = "your_google_ai_studio_api_key_here";
+            if (key == placeholder)
+            {
+                std::cerr << "[FATAL] GEMINI_API_KEY appears to be the "
+                             "placeholder value — refusing live extraction.\n";
+                throw std::runtime_error(
+                    "GEMINI_API_KEY is the default placeholder; replace it "
+                    "with a real key or set AI_MODE=mock");
+            }
+
+            std::cerr << "[extractor] AI_MODE=live, model=" << model << "\n";
+            return std::make_unique<tax::GeminiClient>(
+                key, model, tax::createHttpClient(), schemaJson);
+        }
+
+        // Fallback: offline mock extractor (Phase 1, no network).
+        std::cerr << "[extractor] AI_MODE=" << mode
+                  << " (offline MockExtractor)\n";
+        return std::make_unique<tax::MockExtractor>();
     }
 
     // --- protocol frames (architecture.md §10), as nlohmann::json ----------
@@ -78,14 +147,14 @@ int main()
     const std::string staticDir = getEnv("FRONTEND_DIR", "frontend");
 
     // ------------------------------------------------------------------
-    // The Step F pipeline: MockExtractor seam + rules config + SQLite.
-    // Swap the MockExtractor for the GeminiClient in Step G.
+    // The Step F/G pipeline: extractor seam (mock or live Gemini per
+    // AI_MODE) + rules config + SQLite.
     // ------------------------------------------------------------------
     std::unique_ptr<tax::Pipeline> pipeline;
     try
     {
         pipeline = std::make_unique<tax::Pipeline>(
-            std::make_unique<tax::MockExtractor>(),
+            makeExtractor(),
             getEnv("RULES_CONFIG_PATH", "./config/rules_2026.json"),
             getEnv("DATABASE_PATH", "./database/tax_sessions.db"));
     }

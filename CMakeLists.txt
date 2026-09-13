@@ -31,10 +31,23 @@ add_library(tax_core STATIC
   backend/src/RuleEngine.cpp
   backend/src/GSTRGenerator.cpp
   backend/src/MockExtractor.cpp
+  backend/src/GeminiClient.cpp
   backend/src/InvoiceRepository.cpp
   backend/src/Pipeline.cpp
   backend/include/sqlite3.c         # SQLite amalgamation compiled as C
 )
+
+# The HTTPS transport for the probabilistic layer (HttpClient seam):
+# Windows -> WinHTTP (Schannel TLS, no OpenSSL/libcurl on this toolchain);
+# everything else -> libcurl.
+if(WIN32)
+  target_sources(tax_core PRIVATE backend/src/WinHttpClient.cpp)
+  target_link_libraries(tax_core PRIVATE winhttp)
+else()
+  find_package(CURL REQUIRED)
+  target_sources(tax_core PRIVATE backend/src/CurlHttpClient.cpp)
+  target_link_libraries(tax_core PRIVATE CURL::libcurl)
+endif()
 
 # crow.h/crow/*.h resolve via -I backend/include ("crow/..." style includes);
 # standalone Asio resolves via <asio.hpp> from -I backend/include/asio. Public
@@ -68,11 +81,11 @@ target_link_libraries(tax_assistant_server PRIVATE tax_core)
 
 if(WIN32)
   # Static-link into the WinSock subsystem. pthread does not exist on native
-  # MSVC/Windows, so it is never linked here.
+  # MSVC/Windows, so it is never linked here. winhttp has already been attached
+  # to tax_core for the HttpClient transport.
   target_link_libraries(tax_assistant_server PRIVATE ws2_32 crypt32 wsock32)
 else()
-  find_package(CURL REQUIRED)
-  target_link_libraries(tax_assistant_server PRIVATE pthread CURL::libcurl)
+  target_link_libraries(tax_assistant_server PRIVATE pthread)
 endif()
 
 # --- Frontend → build-tree copy (static assets served by Crow) ------------
