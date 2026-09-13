@@ -22,13 +22,18 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
-# tax_core — the deterministic layer, compiled ONCE and shared by the server
-# and every unit test. Immutable integer-cents state machine (Step C).
+# tax_core — the backend library, compiled ONCE and shared by the server and
+# every unit test. Holds the deterministic integer-cent core (Steps C-E), the
+# extractor seam + orchestration (Step F), and the SQLite amalgamation.
 # ---------------------------------------------------------------------------
 add_library(tax_core STATIC
   backend/src/StateMatrix.cpp
   backend/src/RuleEngine.cpp
   backend/src/GSTRGenerator.cpp
+  backend/src/MockExtractor.cpp
+  backend/src/InvoiceRepository.cpp
+  backend/src/Pipeline.cpp
+  backend/include/sqlite3.c         # SQLite amalgamation compiled as C
 )
 
 # crow.h/crow/*.h resolve via -I backend/include ("crow/..." style includes);
@@ -57,7 +62,6 @@ target_compile_options(tax_core PUBLIC ${WARNING_FLAGS})
 # ---------------------------------------------------------------------------
 add_executable(tax_assistant_server
   backend/src/main.cpp
-  backend/include/sqlite3.c            # SQLite amalgamation compiled as C
 )
 
 target_link_libraries(tax_assistant_server PRIVATE tax_core)

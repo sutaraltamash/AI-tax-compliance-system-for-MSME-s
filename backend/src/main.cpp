@@ -1,19 +1,32 @@
 // ============================================================================
-// tax_assistant_server — application entrypoint (Phase 1 scaffold)
+// tax_assistant_server — application entrypoint.
 //
-// Step A goal: a server binary that boots, serves the frontend, and accepts
-// WebSocket connections on /ws. No domain logic lives here yet — the extractor,
-// state matrix, rule engine, and GSTR generator are wired in later steps (C..I).
+// Wires the Step F end-to-end pipeline to the Crow WebSocket gateway:
+//
+//   * /ws negotiates a session (SESSION_INIT with a fresh session id) and then
+//     dispatches the architecture.md §10 message contract onto tax::Pipeline:
+//       UPLOAD_INVOICE -> MockExtractor (IExtractor seam) -> StateMatrix ->
+//                        RuleEngine -> SQLite persistence -> CHAT_MESSAGE gaps
+//       USER_REPLY     -> archived to the transcript
+//       REQUEST_FILING -> GSTRGenerator CSVs -> FILING_READY
+//   * /   serves index.html, /assets/<path> serves the frontend bundle.
+//
+// The extraction seam is swapped for the live GeminiClient by replacing the
+// MockExtractor in the Pipeline constructor call below (Step G).
 // ============================================================================
 
-#include <chrono>
 #include <cstdlib>
+#include <iostream>
+#include <memory>
 #include <string>
-#include <unordered_map>
 
 #include "crow/crow.h"
 #include "crow/json.h"
 #include "crow/middlewares/cors.h"
+
+#include "IExtractor.hpp"
+#include "MockExtractor.hpp"
+#include "Pipeline.hpp"
 
 namespace
 {
@@ -38,14 +51,20 @@ namespace
         return fallback;
     }
 
-    // Session handshake payload per architecture.md §10:
-    //   { "type": "SESSION_INIT", "session_id": "<uuid>" }
-    crow::json::wvalue sessionInitFrame(const std::string& sessionId)
+    // --- protocol frames (architecture.md §10), as nlohmann::json ----------
+
+    tax::json sessionInitFrame(const std::string& sessionId)
     {
-        crow::json::wvalue frame;
-        frame["type"]       = "SESSION_INIT";
-        frame["session_id"] = sessionId;
-        return frame;
+        tax::json f{{"type", "SESSION_INIT"}, {"session_id", sessionId}};
+        return f;
+    }
+
+    tax::json errorChat(const std::string& message)
+    {
+        tax::json f{{"type", "CHAT_MESSAGE"},
+                    {"role", "assistant"},
+                    {"content", message}};
+        return f;
     }
 } // namespace
 
@@ -54,9 +73,27 @@ int main()
     // ------------------------------------------------------------------
     // Runtime configuration (from environment / .env)
     // ------------------------------------------------------------------
-    const std::string host = getEnv("HOST", "0.0.0.0");
-    const int port         = getEnvInt("PORT", 8080);
+    const std::string host      = getEnv("HOST", "0.0.0.0");
+    const int         port      = getEnvInt("PORT", 8080);
     const std::string staticDir = getEnv("FRONTEND_DIR", "frontend");
+
+    // ------------------------------------------------------------------
+    // The Step F pipeline: MockExtractor seam + rules config + SQLite.
+    // Swap the MockExtractor for the GeminiClient in Step G.
+    // ------------------------------------------------------------------
+    std::unique_ptr<tax::Pipeline> pipeline;
+    try
+    {
+        pipeline = std::make_unique<tax::Pipeline>(
+            std::make_unique<tax::MockExtractor>(),
+            getEnv("RULES_CONFIG_PATH", "./config/rules_2026.json"),
+            getEnv("DATABASE_PATH", "./database/tax_sessions.db"));
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "startup failed: " << e.what() << "\n";
+        return 1;
+    }
 
     crow::App<crow::CORSHandler> app;
 
@@ -79,20 +116,93 @@ int main()
     });
 
     CROW_WEBSOCKET_ROUTE(app, "/ws")
-        .onopen([&](crow::websocket::connection& conn) {
-            // Issue a fresh session id per connection. In later phases the
-            // session lifecycle is owned by the persistence layer (Step G).
-            static std::uint64_t counter = 0;
-            const std::string sessionId  = "sess-" + std::to_string(++counter) + "-" +
-                                           std::to_string(
-                                               std::chrono::high_resolution_clock::now()
-                                                   .time_since_epoch()
-                                                   .count());
-            conn.send_text(sessionInitFrame(sessionId).dump());
+        .onopen([&pipeline](crow::websocket::connection& conn) {
+            try
+            {
+                // One tax_sessions row per socket; the id rides on the
+                // connection so every later message names its session.
+                const std::string sessionId = pipeline->openSession();
+                conn.userdata(new std::string(sessionId));
+                conn.send_text(sessionInitFrame(sessionId).dump());
+            }
+            catch (const std::exception& e)
+            {
+                conn.send_text(errorChat(std::string("Failed to open session: ") +
+                                         e.what()).dump());
+            }
         })
-        .onmessage([](crow::websocket::connection& /*conn*/, const std::string& /*data*/, bool /*is_binary*/) {
-            // Payload dispatch arrives in Step I (orchestration). For the scalar
-            // scaffold we acknowledge receipt so the client sees a live round-trip.
+        .onmessage([&pipeline](crow::websocket::connection& conn,
+                               const std::string& data, bool /*is_binary*/) {
+            const auto* sid = static_cast<const std::string*>(conn.userdata());
+            if (sid == nullptr)
+            {
+                conn.send_text(errorChat("No session is bound to this socket. "
+                                         "Reconnect to /ws to start a new session.").dump());
+                return;
+            }
+
+            auto msg = crow::json::load(data);
+            if (!msg)
+            {
+                conn.send_text(errorChat("Message is not valid JSON.").dump());
+                return;
+            }
+
+            tax::PipelineResult result;
+            try
+            {
+                const auto strOrEmpty = [&msg](const char* key) {
+                    return msg.has(key) && msg[key].t() == crow::json::type::String
+                               ? std::string(msg[key].s())
+                               : std::string();
+                };
+                const std::string type = strOrEmpty("type");
+                if (type == "UPLOAD_INVOICE")
+                {
+                    const std::string payload = strOrEmpty("payload");
+                    std::string mime = "application/octet-stream";
+                    if (msg.has("mime_type") &&
+                        msg["mime_type"].t() == crow::json::type::String)
+                    {
+                        mime = std::string(msg["mime_type"].s());
+                    }
+                    result = pipeline->processUpload(*sid, payload, mime);
+                }
+                else if (type == "USER_REPLY")
+                {
+                    result = pipeline->processUserReply(*sid, strOrEmpty("text"));
+                }
+                else if (type == "REQUEST_FILING")
+                {
+                    result = pipeline->requestFiling(*sid);
+                }
+                else
+                {
+                    conn.send_text(
+                        errorChat("Unrecognized message type '" + type + "'.").dump());
+                    return;
+                }
+            }
+            catch (const std::exception& e)
+            {
+                conn.send_text(errorChat(std::string("Server error: ") + e.what()).dump());
+                return;
+            }
+
+            for (const auto& frame : result.frames)
+            {
+                conn.send_text(frame.dump());
+            }
+        })
+        .onclose([&pipeline](crow::websocket::connection& conn,
+                             const std::string& /*reason*/) {
+            auto* sid = static_cast<std::string*>(conn.userdata());
+            if (sid != nullptr)
+            {
+                pipeline->closeSession(*sid);   // ABANDONED unless already FILED
+                delete sid;
+                conn.userdata(nullptr);
+            }
         });
 
     // CORS applies a permissive policy by default (origin/methods/headers = "*").

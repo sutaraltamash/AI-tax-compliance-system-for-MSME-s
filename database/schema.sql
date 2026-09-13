@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     total_value_cents   INTEGER NOT NULL,
     tax_breakdown_json  TEXT,                            -- verbatim extracted breakdown
     extraction_meta_json TEXT,                           -- confidence/warnings from extractor
+    document_json       TEXT,                            -- sanitized extraction doc, verbatim: lossless StateMatrix rehydration for filing after restart
     extracted_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
